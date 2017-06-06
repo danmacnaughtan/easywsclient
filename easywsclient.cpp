@@ -77,6 +77,9 @@
 
 #include "easywsclient.hpp"
 
+using easywsclient::Callback_Imp;
+using easywsclient::BytesCallback_Imp;
+
 namespace { // private module-only namespace
 
 	struct ConnectionContext {
@@ -151,12 +154,14 @@ class _DummyWebSocket : public easywsclient::WebSocket
   public:
     void poll(int timeout) { }
     void send(const std::string& message) { }
+    void sendBinary(const std::string& message) { }
+    void sendBinary(const std::vector<uint8_t>& message) { }
     void sendPing() { }
     void close() { } 
-    void _dispatch(Callback & callable) { }
     readyStateValues getReadyState() const { return CLOSED; }
+    void _dispatch(Callback_Imp & callable) { }
+    void _dispatchBinary(BytesCallback_Imp& callable) { }
 };
-
 
 
 class _RealWebSocket : public easywsclient::WebSocket
@@ -201,7 +206,6 @@ class _RealWebSocket : public easywsclient::WebSocket
 
     std::vector<uint8_t> rxbuf;
     std::vector<uint8_t> txbuf;
-
     std::vector<uint8_t> receivedData;
 
     ConnectionContext* ptConnCtx;
@@ -223,7 +227,7 @@ class _RealWebSocket : public easywsclient::WebSocket
             }
             return;
         }
-        if (timeout > 0) {
+        if (timeout != 0) {
             fd_set rfds;
             fd_set wfds;
             timeval tv = { timeout/1000, (timeout%1000) * 1000 };
@@ -231,7 +235,7 @@ class _RealWebSocket : public easywsclient::WebSocket
             FD_ZERO(&wfds);
             FD_SET(ptConnCtx->sockfd, &rfds);
             if (txbuf.size()) { FD_SET(ptConnCtx->sockfd, &wfds); }
-            select(ptConnCtx->sockfd + 1, &rfds, &wfds, NULL, &tv);
+            select(ptConnCtx->sockfd + 1, &rfds, &wfds, 0, timeout > 0 ? &tv : 0);
         }
         while (true) {
             // FD_ISSET(0, &rfds) will be true
@@ -282,7 +286,22 @@ class _RealWebSocket : public easywsclient::WebSocket
     // lambda:
     //template<class Callable>
     //void dispatch(Callable callable)
-    virtual void _dispatch(WebSocket::Callback & callable) {
+    virtual void _dispatch(Callback_Imp & callable) {
+        struct CallbackAdapter : public BytesCallback_Imp
+            // Adapt void(const std::string<uint8_t>&) to void(const std::string&)
+        {
+            Callback_Imp& callable;
+            CallbackAdapter(Callback_Imp& callable) : callable(callable) { }
+            void operator()(const std::vector<uint8_t>& message) {
+                std::string stringMessage(message.begin(), message.end());
+                callable(stringMessage);
+            }
+        };
+        CallbackAdapter bytesCallback(callable);
+        _dispatchBinary(bytesCallback);
+    }
+
+    virtual void _dispatchBinary(BytesCallback_Imp & callable) {
         // TODO: consider acquiring a lock on rxbuf...
         while (true) {
             wsheader_type ws;
@@ -292,9 +311,9 @@ class _RealWebSocket : public easywsclient::WebSocket
             ws.opcode = (wsheader_type::opcode_type) (data[0] & 0x0f);
             ws.mask = (data[1] & 0x80) == 0x80;
             ws.N0 = (data[1] & 0x7f);
-            ws.header_size = 2 + (ws.N0 == 126? 2 : 0) + (ws.N0 == 127? 6 : 0) + (ws.mask? 4 : 0);
+            ws.header_size = 2 + (ws.N0 == 126? 2 : 0) + (ws.N0 == 127? 8 : 0) + (ws.mask? 4 : 0);
             if (rxbuf.size() < ws.header_size) { return; /* Need: ws.header_size - rxbuf.size() */ }
-            int i;
+            int i = 0;
             if (ws.N0 < 126) {
                 ws.N = ws.N0;
                 i = 2;
@@ -333,14 +352,15 @@ class _RealWebSocket : public easywsclient::WebSocket
 
             // We got a whole message, now do something with it:
             if (false) { }
-            else if (ws.opcode == wsheader_type::TEXT_FRAME
+            else if (
+                   ws.opcode == wsheader_type::TEXT_FRAME 
+                || ws.opcode == wsheader_type::BINARY_FRAME
                 || ws.opcode == wsheader_type::CONTINUATION
             ) {
                 if (ws.mask) { for (size_t i = 0; i != ws.N; ++i) { rxbuf[i+ws.header_size] ^= ws.masking_key[i&0x3]; } }
                 receivedData.insert(receivedData.end(), rxbuf.begin()+ws.header_size, rxbuf.begin()+ws.header_size+(size_t)ws.N);// just feed
                 if (ws.fin) {
-                    std::string data(receivedData.begin(), receivedData.end());
-                    callable((const std::string) data);
+                    callable((const std::vector<uint8_t>) receivedData);
                     receivedData.erase(receivedData.begin(), receivedData.end());
                     std::vector<uint8_t> ().swap(receivedData);// free memory
                 }
@@ -348,7 +368,7 @@ class _RealWebSocket : public easywsclient::WebSocket
             else if (ws.opcode == wsheader_type::PING) {
                 if (ws.mask) { for (size_t i = 0; i != ws.N; ++i) { rxbuf[i+ws.header_size] ^= ws.masking_key[i&0x3]; } }
                 std::string data(rxbuf.begin()+ws.header_size, rxbuf.begin()+ws.header_size+(size_t)ws.N);
-                sendData(wsheader_type::PONG, data);
+                sendData(wsheader_type::PONG, data.size(), data.begin(), data.end());
             }
             else if (ws.opcode == wsheader_type::PONG) { }
             else if (ws.opcode == wsheader_type::CLOSE) { close(); }
@@ -359,14 +379,24 @@ class _RealWebSocket : public easywsclient::WebSocket
     }
 
     void sendPing() {
-        sendData(wsheader_type::PING, std::string());
+        std::string empty;
+        sendData(wsheader_type::PING, empty.size(), empty.begin(), empty.end());
     }
 
     void send(const std::string& message) {
-        sendData(wsheader_type::TEXT_FRAME, message);
+        sendData(wsheader_type::TEXT_FRAME, message.size(), message.begin(), message.end());
     }
 
-    void sendData(wsheader_type::opcode_type type, const std::string& message) {
+    void sendBinary(const std::string& message) {
+        sendData(wsheader_type::BINARY_FRAME, message.size(), message.begin(), message.end());
+    }
+
+    void sendBinary(const std::vector<uint8_t>& message) {
+        sendData(wsheader_type::BINARY_FRAME, message.size(), message.begin(), message.end());
+    }
+
+    template<class Iterator>
+    void sendData(wsheader_type::opcode_type type, uint64_t message_size, Iterator message_begin, Iterator message_end) {
         // TODO:
         // Masking key should (must) be derived from a high quality random
         // number generator, to mitigate attacks on non-WebSocket friendly
@@ -375,7 +405,6 @@ class _RealWebSocket : public easywsclient::WebSocket
         // TODO: consider acquiring a lock on txbuf...
         if (readyState == CLOSING || readyState == CLOSED) { return; }
         std::vector<uint8_t> header;
-        uint64_t message_size = message.size();
         header.assign(2 + (message_size >= 126 ? 2 : 0) + (message_size >= 65536 ? 6 : 0) + (useMask ? 4 : 0), 0);
         header[0] = 0x80 | type;
         if (false) { }
@@ -418,9 +447,9 @@ class _RealWebSocket : public easywsclient::WebSocket
         }
         // N.B. - txbuf will keep growing until it can be transmitted over the socket:
         txbuf.insert(txbuf.end(), header.begin(), header.end());
-        txbuf.insert(txbuf.end(), message.begin(), message.end());
+        txbuf.insert(txbuf.end(), message_begin, message_end);
         if (useMask) {
-            for (size_t i = 0; i != message.size(); ++i) { *(txbuf.end() - message.size() + i) ^= masking_key[i&0x3]; }
+            for (size_t i = 0; i != message_size; ++i) { *(txbuf.end() - message_size + i) ^= masking_key[i&0x3]; }
         }
     }
 
