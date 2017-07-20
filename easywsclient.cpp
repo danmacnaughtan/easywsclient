@@ -139,7 +139,7 @@ void klose(ConnectionContext* ptConnCtx) {
 	if (ptConnCtx->sockfd) {
 		closesocket(ptConnCtx->sockfd);
 	}
-	if (ptConnCtx->sslHandle==NULL) {
+	if (ptConnCtx->sslHandle!=NULL) {
 		SSL_shutdown(ptConnCtx->sslHandle);
 		SSL_free(ptConnCtx->sslHandle);
 	}
@@ -208,8 +208,6 @@ class _RealWebSocket : public easywsclient::WebSocket
     std::vector<uint8_t> txbuf;
     std::vector<uint8_t> receivedData;
 
-    std::vector<uint8_t> receivedData;
-
     ConnectionContext* ptConnCtx;
     readyStateValues readyState;
     bool useMask;
@@ -237,7 +235,7 @@ class _RealWebSocket : public easywsclient::WebSocket
             FD_ZERO(&wfds);
             FD_SET(ptConnCtx->sockfd, &rfds);
             if (txbuf.size()) { FD_SET(ptConnCtx->sockfd, &wfds); }
-            select(ptConnCtx->sockfd + 1, &rfds, &wfds, NULL, timeout > 0 ? &tv : 0);
+            select(ptConnCtx->sockfd + 1, &rfds, &wfds, 0, timeout > 0 ? &tv : 0);
         }
         while (true) {
             // FD_ISSET(0, &rfds) will be true
